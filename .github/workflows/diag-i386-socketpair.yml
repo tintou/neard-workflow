@@ -1,0 +1,110 @@
+name: Diagnose i386 socketpair
+
+# Temporary workflow to find why socketpair() fails in 32-bit containers
+# on newer GitHub runner images.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diag-i386-socketpair]
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    name: socketpair (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+
+    env:
+      IMAGE: i386/debian:stable
+
+    steps:
+    - name: Host information
+      run: |
+        cat /etc/os-release
+        uname -a
+        docker version
+        docker info | grep -i -E 'version|runtime|seccomp|security|kernel|storage'
+        dpkg -l | grep -i -E 'libseccomp|runc|containerd|docker' || true
+
+    - name: Write test program
+      run: |
+        cat > sp.c <<'EOF'
+        #include <errno.h>
+        #include <stdio.h>
+        #include <string.h>
+        #include <sys/socket.h>
+        #include <sys/syscall.h>
+        #include <unistd.h>
+
+        int main(void)
+        {
+        	int s[2];
+        	int r = socketpair(PF_LOCAL, SOCK_STREAM, 0, s);
+
+        	printf("libc socketpair: r=%d errno=%d (%s)\n", r, r ? errno : 0,
+        	       r ? strerror(errno) : "-");
+
+        #ifdef SYS_socketpair
+        	r = syscall(SYS_socketpair, PF_LOCAL, SOCK_STREAM, 0, s);
+        	printf("direct SYS_socketpair: r=%d errno=%d (%s)\n", r,
+        	       r ? errno : 0, r ? strerror(errno) : "-");
+        #endif
+        #ifdef SYS_socketcall
+        	{
+        		unsigned long args[4] = { PF_LOCAL, SOCK_STREAM, 0,
+        					  (unsigned long)s };
+
+        		r = syscall(SYS_socketcall, 8 /* SYS_SOCKETPAIR */, args);
+        		printf("SYS_socketcall(socketpair): r=%d errno=%d (%s)\n", r,
+        		       r ? errno : 0, r ? strerror(errno) : "-");
+        	}
+        #endif
+        	return 0;
+        }
+        EOF
+
+    - name: Build static 32-bit test on the host
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq gcc-multilib >/dev/null
+        gcc -m32 -static sp.c -o sp32
+        file sp32 || true
+
+    - name: Pull image
+      run: docker pull "$IMAGE"
+
+    - name: Run natively on host (no container)
+      continue-on-error: true
+      run: ./sp32
+
+    - name: Run in container with default seccomp profile
+      continue-on-error: true
+      run: docker run --rm -v "$PWD:/w" -w /w "$IMAGE" ./sp32
+
+    - name: Run in container with seccomp unconfined
+      continue-on-error: true
+      run: docker run --rm --security-opt seccomp=unconfined -v "$PWD:/w" -w /w "$IMAGE" ./sp32
+
+    - name: DNS in container with default seccomp profile
+      continue-on-error: true
+      run: docker run --rm "$IMAGE" sh -c 'getent hosts deb.debian.org; echo "getent exit=$?"; cat /etc/resolv.conf'
+
+    - name: DNS in container with seccomp unconfined
+      continue-on-error: true
+      run: docker run --rm --security-opt seccomp=unconfined "$IMAGE" sh -c 'getent hosts deb.debian.org; echo "getent exit=$?"; cat /etc/resolv.conf'
+
+    - name: DNS in amd64 container with default seccomp profile (control)
+      continue-on-error: true
+      run: docker run --rm debian:stable sh -c 'getent hosts deb.debian.org; echo "getent exit=$?"'
+
+    - name: strace of the failing DNS lookup (unconfined, installs strace)
+      continue-on-error: true
+      run: |
+        docker run --rm --network host --security-opt seccomp=unconfined --cap-add SYS_PTRACE "$IMAGE" sh -c \
+          'apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq strace >/dev/null 2>&1; strace -f -e trace=network getent hosts deb.debian.org 2>&1 | tail -30'
